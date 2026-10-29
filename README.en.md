@@ -70,11 +70,113 @@ npm run typecheck    # TypeScript check
 npm test             # charting regression tests
 ```
 
-**No API key is needed for charting.** The open-source version contains **no backend routes**: AI interpretation (`/api/interpret`) and compatibility analysis (`/api/heming`) return 404 until you implement them yourself.
+**No API key is needed for charting.** Charting, chart rendering and compatibility setup all run in the browser using this repo's engine.
+
+### AI interpretation (`/api/interpret` and `/api/heming`)
+
+Upstream's commercial AI prompts and backend routes are not open source. This repo ships **a working open-source implementation**: it serialises the real output of the charting engine (12 palaces, star brightness, four-transform landing palaces, detected patterns, decade/year transforms) into a textual "chart sheet" for the model, requires the model to reason **only from that chart sheet**, and streams the answer back over SSE.
+
+| File | Role |
+|---|---|
+| `lib/ai/config.ts` | Env parsing: protocol, endpoint, key, model, token budget |
+| `lib/ai/provider.ts` | Streaming client: Anthropic Messages protocol + OpenAI-compatible protocol |
+| `lib/ai/chart-context.ts` | Chart → chart sheet (12 palaces, brightness, four transforms, sanfang-sizheng, patterns) |
+| `lib/ai/prompt.ts` | System prompts for interpretation and compatibility (reuses `heming-knowledge.ts`) |
+| `lib/ai/sse.ts` | SSE event wrapper (matches the frontend's `data: {"delta":{"text":...}}` contract) |
+| `lib/ai/validate.ts` | Request validation + birthplace whitelist (injection guard) |
+| `lib/ai/sanitize.ts` | Output cleanup: strips English words the model occasionally slips in |
+| `lib/ai/guard.ts` | Public-exposure guard: per-IP rate limit + global concurrency cap + daily quota |
+| `lib/ai/handlers.ts` | Shared handler for interpretation / compatibility (used by both the Next route and the Cloudflare Pages Function) |
+| `app/api/interpret/route.ts` | AI chart interpretation |
+| `app/api/heming/route.ts` | AI compatibility analysis |
+
+Configure a model in `.env.local` — both protocols are supported:
+
+```bash
+# Anthropic protocol
+AI_PROVIDER=anthropic
+AI_BASE_URL=https://api.anthropic.com/v1
+AI_AUTH_MODE=api-key          # or bearer for private endpoints
+AI_API_KEY=sk-...
+AI_MODEL=your-model-id
+
+# OpenAI-compatible protocol (DeepSeek / MiMo / OpenAI, ...)
+AI_PROVIDER=deepseek          # or mimo / openai
+DEEPSEEK_API_KEY=sk-...
+```
+
+> **Give `AI_MAX_TOKENS` enough room.** Models with thinking (MiniMax M3 and friends) spend a large slice of the output budget on reasoning first; too small a budget truncates the response *before the answer starts* — the symptom is "not a single character of answer". The default is 16384; DeepSeek caps output at 8K, so set `AI_MAX_TOKENS=8192` there. The route has a safety net: if the response is truncated with zero output it retries once with 4x the budget.
+
+`scripts/smoke-ai.ts` is a live smoke test against the real model — run `npm run dev` first, then `npx tsx scripts/smoke-ai.ts`.
+
+> **On "no English mixed into the body"**: the prompt already states that rule, but the model still occasionally emits something like "重道义、 fairness 与担当". So the output goes through one more layer (`lib/ai/sanitize.ts`): Latin letter runs are removed, then leftover empty brackets, stray spaces and doubled separators are tidied up. There is no legitimate English in a Ziwei reading; numbers and Markdown markers are untouched.
+
+#### Before exposing the site publicly: quota protection
+
+Chart casting itself is free (it runs in the browser), but **AI interpretation costs money**. Once the site is reachable from the internet, anyone with the link can call `/api/interpret` and `/api/heming` and burn your API key quota. Both routes therefore pass through a guard by default (`lib/ai/guard.ts`):
+
+| Protection | Default | Environment variable |
+|---|---|---|
+| Sliding-window rate limit per source | 6 requests / minute | `AI_RATE_LIMIT_PER_WINDOW` / `AI_RATE_LIMIT_WINDOW_MS` |
+| Global concurrency cap | 2 simultaneous model calls | `AI_MAX_CONCURRENT` |
+| Global daily quota | 60 requests / day | `AI_DAILY_REQUEST_CAP` (`0` = unlimited) |
+
+Exceeding a limit returns `429` with a short Chinese message. The frontend treats that as a failed request, so don't set these three to 0. Raise them for personal use; keep the defaults (or tighter) when sharing the link.
+
+> Upstream explicitly states that server-side security (signing, anti-abuse, watermarking) is out of scope for the open-source release. What ships here is a **quota-level safety net** (rate limit + concurrency + daily cap) — not a full account system or signed requests. If you intend to operate this publicly, add login, signing and per-user billing yourself.
+
+**Reaching the site from the internet (tunnel / reverse proxy)**: `next dev` blocks cross-origin `/_next/hmr` and `/__nextjs_font/*`, so a public hostname makes the console spam "Blocked cross-origin request to Next.js dev resource". This repo already opens it up in `next.config.js`:
+
+```js
+allowedDevOrigins: ['*.trycloudflare.com'],
+```
+
+The wildcard covers the random hostname a tunnel picks on every restart; swap it for your own domain (and restart the dev server) if you use one. A production build (`next build && next start`) is not affected.
+
+**SSE heartbeat**: interpretation is streamed, and the model may spend a minute or two thinking. If nothing is written during that window, a CDN in the middle will cut the connection (Cloudflare shows `524`, or returns 200 with an empty body). So the implementation sends an SSE comment heartbeat (`: open`) both at the **start** of the stream and **every 15 seconds while generating**. The frontend filters on the `data: ` prefix and skips those comment lines.
+
+### Deploying to Cloudflare Pages (`pages.dev` is reachable from mainland China)
+
+Charting runs entirely in the browser, but AI interpretation needs a server, so this repo supports two deployment shapes:
+
+| | Vercel | Cloudflare Pages |
+|---|---|---|
+| Hostname | `*.vercel.app` | `*.pages.dev` |
+| Reachability from mainland China | **blocked by SNI filtering** — usually unreachable | directly reachable |
+| Server-side routes | Next Route Handlers (`app/api/*`) | Pages Functions (`functions/api/*`) |
+| Shared logic | both use `lib/ai/handlers.ts`, identical wire protocol | same |
+
+> Field note: `*.vercel.app` is blocked in mainland China via both DNS poisoning and a TLS-handshake reset keyed on SNI (on the same machine `api.vercel.com` answers normally while `*.vercel.app` gets RST during the handshake). For an audience in mainland China, deploy to `pages.dev` or your own domain instead.
+
+`scripts/build-pages.mjs` produces the Pages bundle. It does three things:
+
+1. runs Next's static export (`output: 'export'`) into `out/` — in export mode `next.config.js` narrows `pageExtensions` to `['tsx']` so the `app/api/*` server routes are excluded from the build;
+2. bundles `functions-src/api/*.ts` into Workers-runtime ESM with esbuild, written to `functions/`;
+3. writes `wrangler.toml`.
+
+```bash
+# dependency: npm i -g wrangler
+npm run build:pages            # same as: node scripts/build-pages.mjs
+
+wrangler login                 # authorise once in the browser
+wrangler pages project create ziwei-doushu
+
+# keep the key out of the repo
+wrangler pages secret put AI_API_KEY --project-name ziwei-doushu
+wrangler pages secret put AI_MODEL --project-name ziwei-doushu
+# the rest (AI_PROVIDER / AI_PROTOCOL / AI_BASE_URL / AI_AUTH_MODE / AI_MAX_TOKENS / AI_TIMEOUT_MS)
+# go in Pages dashboard → Settings → Environment variables
+
+wrangler pages deploy out --project-name ziwei-doushu
+```
+
+Local pre-flight (no login needed): `node scripts/make-dev-vars.mjs` converts `.env.local` into `.dev.vars`, then `wrangler pages dev out --port 8788` runs `/api/interpret` and `/api/heming` on a real Workers runtime.
+
+> Note: Pages Functions receive environment variables in `context.env`, not `process.env`. Both handlers in `lib/ai/handlers.ts` therefore take the env bag explicitly — Next passes `process.env`, Pages passes `context.env` — so both runtimes share one implementation. `.dev.vars`, `out/`, `functions/` and `.wrangler/` are all in `.gitignore`.
 
 ## What is not included
 
-The interpretation database (`lib/ziwei/db-analysis.ts` is a placeholder), AI prompts, all `/api/*` backend routes, user accounts, payments, and deployment configuration.
+The interpretation database (`lib/ziwei/db-analysis.ts` is a placeholder), upstream's own AI prompts, the productionised backend around the API routes (user accounts, payments, server-side signing / anti-abuse / watermarking), and deployment configuration.
 
 ## Interpretation dataset v4.0 (674,976 charts × 13 topics, 2026-10-15)
 

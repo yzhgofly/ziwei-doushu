@@ -33,7 +33,16 @@ export const dynamicParams = false;
 export async function generateStaticParams() {
   const routes = getAllKnowledgeRoutes();
   // URL 用拼音 slug 替代中文，避开 Vercel/CDN 中文路由边界问题
-  return routes.map(r => ({ star: r.slug, topic: r.topic }));
+  const params = routes.map(r => ({ star: r.slug, topic: r.topic }));
+  if (params.length > 0) return params;
+
+  // 开源版的断语库（lib/ziwei/db-analysis.ts）是占位符，一条内容都没有，
+  // 于是路由列表为空。Next 的静态导出（output: 'export'）要求至少生成一条路由，
+  // 否则整个构建会失败：
+  //   Error: Page "/knowledge/[star]/[topic]" returned an empty array from "generateStaticParams()"
+  // 所以这里兜一个最小集合，让导出能跑通；这些页面内容为空（渲染时走 notFound）。
+  // 补上真实断语库后走上面的正常分支，不受这段影响。
+  return [{ star: STAR_TO_SLUG[ALL_STARS[0]], topic: ALL_TOPICS[0] }];
 }
 
 export async function generateMetadata({ params }: { params: Promise<{ star: string; topic: string }> }) {

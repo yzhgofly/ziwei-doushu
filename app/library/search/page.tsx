@@ -1,18 +1,24 @@
 /**
  * /library/search?q=xxx — 搜索结果页
+ *
+ * 原来这是服务端页面，直接读 searchParams。静态导出（Cloudflare Pages）时
+ * 服务端拿不到查询串，所以改成客户端组件：URL 参数在浏览器里取，
+ * 古籍原文数据一共只有 27KB，直接打进前端即可，离线也能搜。
+ *
+ * metadata 挪到了同目录的 layout.tsx（客户端组件不能导出 metadata）。
  */
 
+'use client';
+
+import { Suspense, useMemo } from 'react';
 import Link from 'next/link';
+import { useSearchParams } from 'next/navigation';
 import { searchClassics, getParagraphById } from '@/lib/classics';
 
-export const metadata = {
-  title: '搜索 · 古籍原典库',
-};
-
-export default async function SearchPage({ searchParams }: { searchParams: Promise<{ q?: string }> }) {
-  const sp = await searchParams;
-  const q = sp.q?.trim() || '';
-  const hits = q ? searchClassics(q, 50) : [];
+function SearchResult() {
+  const sp = useSearchParams();
+  const q = (sp.get('q') ?? '').trim();
+  const hits = useMemo(() => (q ? searchClassics(q, 50) : []), [q]);
 
   return (
     <div style={{ background: 'var(--bg-page)', minHeight: '100vh' }}>
@@ -24,7 +30,7 @@ export default async function SearchPage({ searchParams }: { searchParams: Promi
         <div style={{ fontSize: '12px', color: 'var(--tx-3)', letterSpacing: '0.2em' }}>
           搜索结果
         </div>
-        <Link href="/" style={{ fontSize: '12px', color: 'var(--ac)', letterSpacing: '0.2em', textDecoration: 'none' }}>
+        <Link href="/" style={{ fontSize: '12px', color: 'var(--ac)', letterSpacing: '0.3em', textDecoration: 'none' }}>
           首页 →
         </Link>
       </div>
@@ -117,5 +123,14 @@ export default async function SearchPage({ searchParams }: { searchParams: Promi
         mark { background: rgba(184,146,42,0.3); color: #8b6a14; padding: 0 2px; border-radius: 2px; font-weight: 600; }
       `}</style>
     </div>
+  );
+}
+
+export default function SearchPage() {
+  // useSearchParams 在静态导出时必须在 Suspense 里，否则预渲染会报错
+  return (
+    <Suspense fallback={<div style={{ background: 'var(--bg-page)', minHeight: '100vh' }} />}>
+      <SearchResult />
+    </Suspense>
   );
 }

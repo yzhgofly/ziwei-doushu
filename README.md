@@ -276,7 +276,7 @@ cd ziwei-doushu
 # 安装依赖
 npm install
 
-# 配置环境变量（只看排盘可以跳过；AI 配置仅在你自己实现了 /api/* 接口时才用得上）
+# 配置环境变量（只看排盘可以跳过；要用 AI 解读才需要填 Key）
 cp .env.example .env.local
 
 # 启动开发服务器
@@ -287,12 +287,114 @@ npm run dev
 
 ```bash
 npm run typecheck   # TypeScript 全量类型检查
-npm test            # 排盘引擎回归（768 盘 × 紫微铁律、夏令时、立春边界、红鸾天喜、样本时辰一致性、时辰序号边界、日期合法性、同宫双四化）
+npm test            # 排盘引擎回归（768 盘 × 紫微铁律、夏令时、立春边界、红鸾天喜、样本时辰一致性、时辰序号边界、日期合法性、同宫双四化）+ AI 解读纯逻辑回归
 ```
 
 每次 push 与 PR 都会在 GitHub Actions 上跑同一套（见 [`.github/workflows/ci.yml`](./.github/workflows/ci.yml)）。
 
-> **注意：开源版不含后端 API 路由。**排盘、命盘展示、合盘起盘都在浏览器里用本仓库的引擎完成，**不需要任何 API Key**。AI 解读（`/api/interpret`）和合盘 AI 分析（`/api/heming`）需要你自己实现接口；没实现之前，这两处会直接提示「开源版不含该接口」，配置 API Key 也不会变成可用（#30 就是这个原因）。
+> **排盘不需要任何 API Key。**排盘、命盘展示、合盘起盘都在浏览器里用本仓库的引擎完成。
+
+### AI 解读（`/api/interpret` 与 `/api/heming`）
+
+上游商业版的 AI 解读 prompt 与后端路由不开源。本仓库**提供了一套可用的开源实现**：把排盘引擎的真实输出（十二宫星曜、亮度、四化落宫、命盘格局、大限流年）序列化成「盘面文字」交给大模型，要求它**只依据盘面数据推理**，再用 SSE 流式返回。
+
+| 文件 | 作用 |
+|---|---|
+| `lib/ai/config.ts` | 环境变量解析：协议、端点、密钥、模型、token 预算 |
+| `lib/ai/provider.ts` | 流式客户端：Anthropic Messages 协议 + OpenAI 兼容协议 |
+| `lib/ai/chart-context.ts` | 命盘 → 盘面文字（12 宫、亮度、四化、三方四正、格局） |
+| `lib/ai/prompt.ts` | 解读 / 合盘两套 system prompt（合盘复用 `heming-knowledge.ts`） |
+| `lib/ai/sse.ts` | SSE 事件封装（与前端 `data: {"delta":{"text":...}}` 约定一致） |
+| `lib/ai/validate.ts` | 请求体校验 + 出生地白名单（防注入） |
+| `lib/ai/sanitize.ts` | 输出净化：去掉模型偶尔混进来的英文单词 |
+| `lib/ai/guard.ts` | 公网防护：单 IP 限流 + 全局并发上限 + 每日配额 |
+| `lib/ai/handlers.ts` | 解读 / 合盘的共享处理器（Next 路由与 Cloudflare Pages Functions 共用） |
+| `app/api/interpret/route.ts` | AI 命盘解读 |
+| `app/api/heming/route.ts` | 合盘 AI 分析 |
+
+在 `.env.local` 里配好模型即可，两种协议都支持：
+
+```bash
+# Anthropic 协议
+AI_PROVIDER=anthropic
+AI_BASE_URL=https://api.anthropic.com/v1
+AI_AUTH_MODE=api-key          # 或 bearer（私有端点常用）
+AI_API_KEY=sk-...
+AI_MODEL=your-model-id
+
+# OpenAI 兼容协议（DeepSeek / MiMo / OpenAI 等）
+AI_PROVIDER=deepseek          # 或 mimo / openai
+DEEPSEEK_API_KEY=sk-...
+```
+
+> **`AI_MAX_TOKENS` 要给够。**带 thinking 的模型（MiniMax M3 等）会先花掉一大截输出预算做思考，给小了会在正文开始前就被截断——表现是「正文一个字都没有」。默认 16384；用 DeepSeek 时它最高输出 8K，请设 `AI_MAX_TOKENS=8192`。路由里带了兜底：被截断且零输出时会自动把预算翻 4 倍重试一次。
+
+想接自己的模型，直接改 `lib/ai/provider.ts` 即可；`scripts/smoke-ai.ts` 是打真实模型的冒烟脚本（`npm run dev` 之后跑 `npx tsx scripts/smoke-ai.ts`）。
+
+> **关于「正文不得中英夹杂」**：prompt 里已经下了硬规则，但生成侧仍会偶发写出「重道义、 fairness 与担当」这种句子。所以输出前还有一层净化（`lib/ai/sanitize.ts`）：删掉正文里的拉丁字母词，并把删除后残留的空括号、多余空格、重复顿号收拾干净。命理正文里不存在合法英文，数字与 Markdown 标记不受影响。
+
+#### 公网暴露前必读：额度防护
+
+排盘本身不花钱（浏览器本地算），**AI 解读要花钱**。站点一旦开到公网，任何拿到链接的人都能调 `/api/interpret` 和 `/api/heming` 消耗你的 API Key 额度。所以这两个接口默认就带一道闸（`lib/ai/guard.ts`）：
+
+| 防护 | 默认值 | 环境变量 |
+|---|---|---|
+| 单个来源滑动窗口限流 | 每分钟 6 次 | `AI_RATE_LIMIT_PER_WINDOW` / `AI_RATE_LIMIT_WINDOW_MS` |
+| 全局并发上限 | 同时 2 个模型调用 | `AI_MAX_CONCURRENT` |
+| 全局每日配额 | 60 次/天 | `AI_DAILY_REQUEST_CAP`（设 0 = 不限） |
+
+超限直接返回 `429` 和一句中文提示。前端会把它当成接口失败，所以别把这三项调到 0。本机自用可以调高，对外分享建议保持默认甚至更严。
+
+> 上游明确声明「服务端安全（签名、防刷、水印）」不在开源范围。这里实现的是**额度层面的兜底**（限流 + 并发 + 日配额），不等于完整的用户系统与签名机制；要正式对外运营，请自行补上登录、签名与按用户计费。
+
+**从公网访问（隧道 / 反向代理）还要注意**：`next dev` 会拦截跨源的 `/_next/hmr` 与 `/__nextjs_font/*`，从公网域名打开时控制台会刷 "Blocked cross-origin request to Next.js dev resource"。本仓库已在 `next.config.js` 里放开：
+
+```js
+allowedDevOrigins: ['*.trycloudflare.com'],
+```
+
+用通配符是为了兼容隧道每次重启都会变的随机域名；换成自己的域名，把通配符换成具体域名即可（改完要重启 dev server）。正式部署用 `next build && next start` 则不受此限制。
+
+**SSE 心跳**：解读是流式返回的，模型思考可能要一两分钟。这期间如果一个字节都不发，经过 CDN 时会被边缘节点掐断（Cloudflare 表现为 `524`，或者返回 200 但正文 0 字）。所以实现里在流的**开头**和**生成期间每 15 秒**各发一行 SSE 注释心跳（`: open`），把连接保持活着；前端按 `data: ` 前缀过滤，会直接跳过这些注释行。
+
+### 部署到 Cloudflare Pages（`pages.dev` 在大陆可直接访问）
+
+排盘本身是纯浏览器计算，AI 解读需要服务端，所以这个仓库有两种部署形态：
+
+| | Vercel | Cloudflare Pages |
+|---|---|---|
+| 域名 | `*.vercel.app` | `*.pages.dev` |
+| 大陆可达性 | **被按 SNI 封锁**，多数网络打不开 | 可直接访问 |
+| 服务端接口 | Next Route Handler（`app/api/*`） | Pages Functions（`functions/api/*`） |
+| 两边的处理逻辑 | 共用 `lib/ai/handlers.ts`，协议完全一致 | 同左 |
+
+> 踩坑记录：`*.vercel.app` 在大陆是 DNS 污染 + TLS 握手按 SNI 重置双重封锁（同一台机器上 `api.vercel.com` 正常返回，而 `*.vercel.app` 在握手阶段被 RST）。所以面向大陆用户的部署应该走 `pages.dev` 或自有域名。
+
+Pages 这条路的构建脚本是 `scripts/build-pages.mjs`，它做三件事：
+
+1. 跑 Next 的静态导出（`output: 'export'`）产出 `out/`。导出模式下 `next.config.js` 会把 `pageExtensions` 收窄成 `['tsx']`，把 `app/api/*` 这些服务端路由挡在构建之外；
+2. 用 esbuild 把 `functions-src/api/*.ts` 打成 Workers 运行时能跑的 ESM，放进 `functions/`；
+3. 写出 `wrangler.toml`。
+
+```bash
+# 依赖：npm i -g wrangler
+npm run build:pages            # 等价于 node scripts/build-pages.mjs
+
+wrangler login                 # 浏览器里授权一次
+wrangler pages project create ziwei-doushu
+
+# 密钥走 secret，不要写进仓库
+wrangler pages secret put AI_API_KEY --project-name ziwei-doushu
+wrangler pages secret put AI_MODEL --project-name ziwei-doushu
+# 其余变量（AI_PROVIDER / AI_PROTOCOL / AI_BASE_URL / AI_AUTH_MODE / AI_MAX_TOKENS / AI_TIMEOUT_MS）
+# 在 Pages 控制台的 Settings → Environment variables 里加
+
+wrangler pages deploy out --project-name ziwei-doushu
+```
+
+本地先验一把（不需要登录）：`node scripts/make-dev-vars.mjs` 会把 `.env.local` 转成 `.dev.vars`，然后 `wrangler pages dev out --port 8788` 就能在本地用真正的 Workers 运行时跑 `/api/interpret`、`/api/heming`。
+
+> 注意：Pages Functions 拿到的环境变量在 `context.env` 里，不是 `process.env`。所以 `lib/ai/handlers.ts` 的两个处理器都显式接收环境变量对象，Next 侧传 `process.env`、Pages 侧传 `context.env`，两边共用同一份逻辑。`.dev.vars`、`out/`、`functions/`、`.wrangler/` 都已在 `.gitignore` 里。
 
 ---
 
@@ -380,10 +482,10 @@ npm test            # 排盘引擎回归（768 盘 × 紫微铁律、夏令时�
 
 | | 内容 |
 |---|---|
-| ✅ **开源** | 排盘引擎（`lib/ziwei/`）、古籍公版原文（`lib/classics/`）、SEO 知识图谱（`lib/seo/`）、Demo 界面、51.8 万样本数据集、13 维解读数据集 v4.0 |
-| ❌ **不开源** | 断语库（`lib/ziwei/db-analysis.ts` 是占位，线上是上万行的 13 主题断语）、AI 解读 prompt、后端 API（`/api/interpret` 等）、用户系统（登录 / 会员 / 支付）、服务端安全（签名、防刷、水印）、部署配置 |
+| ✅ **开源** | 排盘引擎（`lib/ziwei/`）、古籍公版原文（`lib/classics/`）、SEO 知识图谱（`lib/seo/`）、Demo 界面、51.8 万样本数据集、13 维解读数据集 v4.0、AI 解读接口的一套可用实现（`lib/ai/` + `app/api/`，prompt 自行编写、非上游那一版） |
+| ❌ **不开源** | 断语库（`lib/ziwei/db-analysis.ts` 是占位，线上是上万行的 13 主题断语）、上游那一版 AI 解读 prompt、后端 API 的完整工程化（用户系统 / 登录 / 会员 / 支付、服务端安全如签名与防刷与水印）、部署配置 |
 
-如果你需要 AI 解读能力，可以参考 `lib/ziwei/patterns.ts` 和 `heming-knowledge.ts` 里的知识库，结合任意 LLM 自行构建 prompt。
+AI 解读的可用实现见「三、快速开始 → AI 解读」一节；上游那一版 prompt 与断语库仍然不在开源范围，本仓库这套是基于排盘引擎真实输出自己写的。
 
 ---
 

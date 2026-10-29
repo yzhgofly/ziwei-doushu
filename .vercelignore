@@ -1,0 +1,19 @@
+# 本地密钥文件绝不能上传（.env.local 里有 AI API Key）
+.env*
+!.env.example
+.dev.vars
+
+# 构建产物与依赖
+.next
+.next-export
+node_modules
+.vercel
+
+# Cloudflare Pages 的产物（Vercel 侧用不到）
+out
+functions
+.wrangler
+
+# 本地日志与临时脚本
+*.log
+_probe_*.ts
