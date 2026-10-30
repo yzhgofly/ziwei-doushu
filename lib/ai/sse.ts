@@ -34,8 +34,31 @@ export const SSE_DONE = 'data: [DONE]\n\n';
  */
 export const SSE_KEEPALIVE = ': open\n\n';
 
-/** 心跳间隔（毫秒）。边缘节点的空闲超时通常是 100 秒，15 秒足够安全。 */
-export const SSE_KEEPALIVE_INTERVAL_MS = 15_000;
+/**
+ * 开流后立刻发的「已受理」事件。
+ *
+ * 只发注释心跳有个隐患：有些中间件（CDN、代理、浏览器的 HTTP/2 层）
+ * 只把**真正的内容**当作「响应已经开始」，注释行不算。
+ * 于是响应头迟迟不推给客户端，边缘节点在到达超时点时直接掐断连接，
+ * 前端拿到的是 `TypeError: network error`——一个字都没有，也不知道发生了什么。
+ *
+ * 补一个真正的 data 事件，响应才算明确开始，前端也能立刻知道「请求收到了」。
+ * 前端会忽略没有 delta / error 字段的事件，所以不影响正文解析。
+ */
+export const SSE_STATUS_ACCEPTED = 'accepted';
+
+/**
+ * 生成期间的心跳状态事件。
+ *
+ * 注释行（`: open`）有些中间件不认，只发注释的话连接在它们眼里可能一直是「空的」，
+ * 于是到超时点直接掐断。所以心跳同时发一个真正的 data 事件：
+ * 连接上每 10 秒就有一次真实内容，任何一层都不会误判。
+ * 前端会忽略没有 delta / error 字段的事件。
+ */
+export const SSE_STATUS_WAITING = 'waiting';
+
+/** 心跳间隔（毫秒）。边缘节点的空闲超时通常是 100 秒，10 秒足够安全。 */
+export const SSE_KEEPALIVE_INTERVAL_MS = 10_000;
 
 /**
  * 把一个「逐段吐文本」的异步生成器包装成 SSE 响应体。
@@ -52,6 +75,9 @@ export function createSseStream(
       // 带 thinking 的模型思考 30~90 秒，Cloudflare 会直接甩一个 524 超时页。
       try {
         controller.enqueue(encoder.encode(SSE_KEEPALIVE));
+        // 再补一个真正的 data 事件：光有注释行，有些中间件不认「响应已经开始」，
+        // 会在超时点直接掐断连接，前端只看到一个没有解释的 network error。
+        controller.enqueue(encoder.encode(sseEvent({ status: SSE_STATUS_ACCEPTED })));
       } catch { /* 流已关闭 */ }
 
       // 生成期间也要周期性心跳。
@@ -62,6 +88,9 @@ export function createSseStream(
       const heartbeat = setInterval(() => {
         try {
           controller.enqueue(encoder.encode(SSE_KEEPALIVE));
+          // 同时补一个真正的 data 事件：注释行有些中间件不认，
+          // 只发注释的话它们可能在超时点直接掐断连接。
+          controller.enqueue(encoder.encode(sseEvent({ status: SSE_STATUS_WAITING })));
         } catch { /* 流已关闭 */ }
       }, SSE_KEEPALIVE_INTERVAL_MS);
 

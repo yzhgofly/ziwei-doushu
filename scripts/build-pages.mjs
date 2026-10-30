@@ -85,6 +85,7 @@ async function bundleFunctions() {
   const entries = [
     path.join(srcFunctionsDir, 'api', 'interpret.ts'),
     path.join(srcFunctionsDir, 'api', 'heming.ts'),
+    path.join(srcFunctionsDir, 'api', 'health.ts'),
   ];
 
   for (const entry of entries) {

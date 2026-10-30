@@ -14,12 +14,12 @@
  */
 
 import { detectPatterns } from '@/lib/ziwei/patterns-core';
-import { resolveAiConfig, type AiConfig } from './config';
+import { resolveAiConfig, describeAiConfig, type AiConfig } from './config';
 import { normalizeMessages, streamAiText, type AiChatMessage } from './provider';
 import { buildHemingSystemPrompt, buildInterpretSystemPrompt } from './prompt';
 import { createSseStream, sseHeaders } from './sse';
 import { parseChart, trimMessages } from './validate';
-import { getRequestGuard, resolveClientKey, withRelease } from './guard';
+import { getRequestGuard, resolveClientKey, resolveGuardOptions, withRelease } from './guard';
 
 /** 环境变量集合：Next 用 process.env，Workers 用 context.env */
 export type EnvBag = Record<string, string | undefined>;
@@ -80,6 +80,99 @@ export async function handleInterpret(request: Request, env: EnvBag = process.en
     createSseStream(withRelease(generator, verdict.release), () => abort.abort()),
     { headers: sseHeaders() }
   );
+}
+
+/**
+ * 真打一次模型，确认「Key / 额度 / 网络 / 模型名」都通。
+ *
+ * 只发一个几乎不要输出的最小请求，不走流式（诊断不需要看内容），
+ * 目的是把「配置看起来对但实际调不通」这种情况区分出来。
+ */
+async function probeModel(cfg: AiConfig): Promise<{ ok: boolean; detail: string; ms: number }> {
+  const url = cfg.protocol === 'anthropic'
+    ? `${cfg.baseURL}/messages`
+    : `${cfg.baseURL}/chat/completions`;
+
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  if (cfg.authMode === 'bearer') {
+    headers['authorization'] = `Bearer ${cfg.apiKey}`;
+  } else {
+    headers['x-api-key'] = cfg.apiKey;
+  }
+  if (cfg.protocol === 'anthropic') {
+    headers['anthropic-version'] = '2023-06-01';
+  }
+
+  const started = Date.now();
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        model: cfg.model,
+        max_tokens: 16,
+        messages: [{ role: 'user', content: '回复「好」' }],
+      }),
+      signal: AbortSignal.timeout(Math.min(cfg.timeoutMs, 30_000)),
+    });
+    const ms = Date.now() - started;
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      return { ok: false, detail: `HTTP ${res.status}：${text.slice(0, 300)}`, ms };
+    }
+    const text = await res.text();
+    return { ok: true, detail: `模型可达，返回 ${text.length} 字节`, ms };
+  } catch (e) {
+    return {
+      ok: false,
+      detail: `无法连接模型服务：${e instanceof Error ? e.message : String(e)}`,
+      ms: Date.now() - started,
+    };
+  }
+}
+
+/**
+ * GET /api/health —— 诊断接口
+ *
+ * 之前「解读失败」只能靠猜，因为前端把真实原因吞了、日志又留不住。
+ * 这个接口把现场状态一次性摊开：
+ *   - AI 配置解析成没成功（缺 Key / 缺模型名 / base URL 不对）
+ *   - 防护闸的实时状态（今天已经用掉多少次、当前并发、每分钟上限）
+ *   - ?probe=1 时再真打一次模型，确认 Key 与额度确实可用
+ *
+ * 不返回任何密钥内容。
+ */
+export async function handleHealth(request: Request, env: EnvBag = process.env): Promise<Response> {
+  const probe = new URL(request.url).searchParams.get('probe') === '1';
+
+  let ai: { ok: boolean; summary?: string; error?: string };
+  let cfg: AiConfig | null = null;
+  try {
+    cfg = resolveAiConfig(env);
+    ai = { ok: true, summary: describeAiConfig(cfg) };
+  } catch (e) {
+    ai = { ok: false, error: e instanceof Error ? e.message : 'AI 配置有误' };
+  }
+
+  const guard = getRequestGuard(env);
+  const body: Record<string, unknown> = {
+    ok: ai.ok,
+    time: new Date().toISOString(),
+    ai,
+    guard: {
+      options: resolveGuardOptions(env),
+      stats: guard.stats(),
+      clientKey: resolveClientKey(request),
+    },
+  };
+
+  if (probe) {
+    body.probe = cfg
+      ? await probeModel(cfg)
+      : { ok: false, detail: 'AI 配置都没解析成功，跳过探测', ms: 0 };
+  }
+
+  return Response.json(body);
 }
 
 /**

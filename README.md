@@ -308,9 +308,12 @@ npm test            # 排盘引擎回归（768 盘 × 紫微铁律、夏令时�
 | `lib/ai/validate.ts` | 请求体校验 + 出生地白名单（防注入） |
 | `lib/ai/sanitize.ts` | 输出净化：去掉模型偶尔混进来的英文单词 |
 | `lib/ai/guard.ts` | 公网防护：单 IP 限流 + 全局并发上限 + 每日配额 |
-| `lib/ai/handlers.ts` | 解读 / 合盘的共享处理器（Next 路由与 Cloudflare Pages Functions 共用） |
+| `lib/ai/handlers.ts` | 解读 / 合盘 / 健康检查的共享处理器（Next 路由与 Cloudflare Pages Functions 共用） |
+| `lib/ai/error-text.ts` | 把接口失败翻译成一句能看懂的中文（状态码 + 服务端原文） |
+| `lib/ai/client-stream.ts` | 前端共用的 SSE 读取器：分片拼接、错误可见化、断流自动重试 |
 | `app/api/interpret/route.ts` | AI 命盘解读 |
 | `app/api/heming/route.ts` | 合盘 AI 分析 |
+| `app/api/health/route.ts` | 诊断接口：配置对不对、额度用掉多少、模型通不通 |
 
 在 `.env.local` 里配好模型即可，两种协议都支持：
 
@@ -339,13 +342,47 @@ DEEPSEEK_API_KEY=sk-...
 
 | 防护 | 默认值 | 环境变量 |
 |---|---|---|
-| 单个来源滑动窗口限流 | 每分钟 6 次 | `AI_RATE_LIMIT_PER_WINDOW` / `AI_RATE_LIMIT_WINDOW_MS` |
-| 全局并发上限 | 同时 2 个模型调用 | `AI_MAX_CONCURRENT` |
-| 全局每日配额 | 60 次/天 | `AI_DAILY_REQUEST_CAP`（设 0 = 不限） |
+| 单个来源滑动窗口限流 | 每分钟 20 次 | `AI_RATE_LIMIT_PER_WINDOW` / `AI_RATE_LIMIT_WINDOW_MS` |
+| 全局并发上限 | 同时 3 个模型调用 | `AI_MAX_CONCURRENT` |
+| 全局每日配额 | 500 次/天 | `AI_DAILY_REQUEST_CAP`（设 0 = 不限） |
 
 超限直接返回 `429` 和一句中文提示。前端会把它当成接口失败，所以别把这三项调到 0。本机自用可以调高，对外分享建议保持默认甚至更严。
 
+> **默认值的由来**：一个人正常逛一张盘面就会连打十几次——每次打开 `/chart` 自动生成一次命格总览，每点一个宫位一次，每点一个四化一次。所以每分钟 6 次这种「看起来很严」的值，普通用户自己就能撞上，然后误以为「解读坏了」。全局日配额 60 次更坑：它是**全站共享**的，站点自己做实测就会把用户的额度吃光，而且失败提示只有一句「解读失败」，根本看不出是被限流了。
+>
+> 要更严就把 `AI_RATE_LIMIT_PER_WINDOW` / `AI_DAILY_REQUEST_CAP` 调小；要更松就调大，三项都是纯环境变量，改完重启即可，不用改代码。
+
 > 上游明确声明「服务端安全（签名、防刷、水印）」不在开源范围。这里实现的是**额度层面的兜底**（限流 + 并发 + 日配额），不等于完整的用户系统与签名机制；要正式对外运营，请自行补上登录、签名与按用户计费。
+
+#### 出问题时先看这里：`/api/health`
+
+以前「解读失败」只能靠猜——前端把真实原因吞成一句「解读失败，请检查 API 配置或稍后重试」，而 serverless 的运行日志往往留不住当时那一次请求。现在有两个入口：
+
+**1. 诊断接口**（Next 与 Pages 都有，不返回任何密钥内容）：
+
+```bash
+curl https://你的域名/api/health
+# {"ok":true,"ai":{"ok":true,"summary":"anthropic 协议 · bearer 鉴权 · … · 模型 MiniMax-M3.1-Flash"},
+#  "guard":{"options":{"maxPerWindow":20,"maxConcurrent":3,"dailyCap":500},
+#           "stats":{"concurrent":0,"dayCount":0,"trackedKeys":0},"clientKey":"…"}}
+
+curl 'https://你的域名/api/health?probe=1'   # 再真打一次模型，确认 Key 与额度确实可用
+# "probe":{"ok":true,"detail":"模型可达，返回 517 字节","ms":3095}
+```
+
+**2. 前端会把真实原因显示出来**：非 2xx 响应会显示 `HTTP 429：请求太频繁，请 12 秒后再试` 这样的完整信息（状态码 + 服务端原文），SSE 流里服务端报的错也会显示，不再是一句笼统的「解读失败」。连接被掐断时会显示现场信息，例如 `解读失败：连接中断，没有收到任何内容（耗时 12.3 秒）`。
+
+**3. 前端会自动重试一次**：解读是长连接流式返回，途中被边缘节点掐断的概率不低。`lib/ai/client-stream.ts` 里做了统一处理——**一个字都没收到时自动重试一次**（已经收到正文就不重试，否则会出现两份内容）；同时修正了老代码的一个丢内容 bug：网络包把一行 SSE 从中间切断时，老代码直接丢掉半行，现在用 carry-over 缓冲区正确拼行。
+
+**4. 开流即发「已受理」事件**：模型带 thinking 时，要思考 20~40 秒才吐第一个字。这期间服务端只发注释行心跳（`: open`），有些中间件（CDN / 代理 / 浏览器的 HTTP/2 层）只把**真正的内容**当作「响应已经开始」，于是迟迟不推响应头，到超时点直接掐断连接——前端拿到的就是一个没有解释的 `network error`。所以开流后立刻补一个真正的 data 事件（`{"status":"accepted"}`），生成期间的心跳也同时发 `{"status":"waiting"}`，保证连接上每 10 秒就有一次真实内容。
+
+**5. 一键自检脚本**（部署完 / 换完 Key 之后跑一下就知道通没通）：
+
+```bash
+node_modules\.bin\tsx scripts/check-live.ts https://你的域名 --probe
+```
+
+它会依次检查健康接口、模型可达性、完整跑一遍 SSE 解读、再做一次并发压测确认**失败时返回的是可读原因**。
 
 **从公网访问（隧道 / 反向代理）还要注意**：`next dev` 会拦截跨源的 `/_next/hmr` 与 `/__nextjs_font/*`，从公网域名打开时控制台会刷 "Blocked cross-origin request to Next.js dev resource"。本仓库已在 `next.config.js` 里放开：
 

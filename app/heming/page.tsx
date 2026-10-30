@@ -6,6 +6,7 @@ import { formToBirthInfo } from '@/lib/ziwei/share';
 import { generateChart as buildChart } from '@/lib/ziwei/algorithm';
 import type { BirthInfo, ZiweiChart } from '@/lib/ziwei/types';
 import { useTheme } from '@/components/ThemeProvider';
+import { fetchSseText, SseStreamError } from '@/lib/ai/client-stream';
 
 // ─── AiContent 渲染器（与 InsightPanel 一致）────────────────
 function AiContent({ text, streaming }: { text: string; streaming?: boolean }) {
@@ -63,7 +64,10 @@ export default function HemingPage() {
   const [analysis, setAnalysis] = useState('');
   const [analyzing, setAnalyzing] = useState(false);
   const [question, setQuestion] = useState('');
-  const [analysisError, setAnalysisError] = useState(false);
+  // 失败原因直接展示（状态码 + 服务端文案），不再一律吞成「暂时不可用」
+  const [analysisError, setAnalysisError] = useState<string | null>(null);
+  // 断流自动重试时的提示（与正文分开，失败后不会残留一句「正在重试…」）
+  const [retryNote, setRetryNote] = useState<string | null>(null);
   // 开源版不含 /api/heming：接口 404 时单独说明，而不是让用户反复重试
   const [apiMissing, setApiMissing] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
@@ -92,7 +96,8 @@ export default function HemingPage() {
     }
     setAnalyzing(true);
     setAnalysis('');
-    setAnalysisError(false);
+    setAnalysisError(null);
+    setRetryNote(null);
 
     try {
       // 并行起两张盘（如果还没起）
@@ -105,44 +110,37 @@ export default function HemingPage() {
       cA = newA;
       cB = newB;
       if (!cA || !cB) {
-        setAnalysisError(true);
+        setAnalysisError('起盘失败：请检查双方出生信息（年、月、日、性别、生时）是否完整有效。');
         setAnalyzing(false);
         return;
       }
       if (!chartA) setChartA(cA);
       if (!chartB) setChartB(cB);
 
-      const res = await fetch('/api/heming', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chartA: cA, chartB: cB, question: q ?? undefined }),
+      await fetchSseText({
+        doFetch: async () => {
+          const res = await fetch('/api/heming', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chartA: cA, chartB: cB, question: q ?? undefined }),
+          });
+          if (res.status === 404) { setApiMissing(true); throw new Error('api-missing'); }
+          return res;
+        },
+        onDelta: (full) => { setRetryNote(null); setAnalysis(full); },
+        onRetry: (_attempt, _max, reason) => setRetryNote(`${reason}，正在重试…`),
       });
-      if (res.status === 404) { setApiMissing(true); throw new Error('api-missing'); }
-      if (!res.ok || !res.body) throw new Error();
-
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let text = '';
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const chunk = decoder.decode(value, { stream: true });
-        for (const line of chunk.split('\n')) {
-          if (!line.startsWith('data: ')) continue;
-          const data = line.slice(6);
-          if (data === '[DONE]') break;
-          try {
-            const delta = JSON.parse(data).delta?.text ?? '';
-            text += delta;
-            setAnalysis(text);
-          } catch { /* skip */ }
-        }
-      }
       // scroll to analysis
       setTimeout(() => analysisRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100);
-    } catch {
-      setAnalysisError(true);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : '';
+      setRetryNote(null);
+      if (msg === 'api-missing') {
+        // 404 由 apiMissing 分支单独提示
+      } else {
+        // 真实原因：状态码 + 服务端文案 / 流中断的现场信息
+        setAnalysisError(e instanceof SseStreamError ? e.describe() : (msg || '分析失败，请稍后重试。'));
+      }
     } finally {
       setAnalyzing(false);
     }
@@ -280,13 +278,19 @@ export default function HemingPage() {
             </div>
           )}
 
+          {retryNote && (
+            <div style={{ padding: '12px 16px', borderRadius: '10px', border: '1px solid var(--bdr)', background: 'var(--bg-card)', fontSize: '13px', color: 'var(--tx-2)', marginTop: '12px' }}>
+              {retryNote}
+            </div>
+          )}
+
           {analysis && <AiContent text={analysis} streaming={analyzing} />}
 
-          {analysisError && (
-            <div style={{ padding: '12px 16px', borderRadius: '10px', border: '1px solid var(--bdr)', background: 'var(--bg-card)', fontSize: '13px', color: 'var(--tx-2)', marginTop: '12px' }}>
+          {(analysisError || apiMissing) && (
+            <div style={{ padding: '12px 16px', borderRadius: '10px', border: '1px solid var(--bdr)', background: 'var(--bg-card)', fontSize: '13px', color: 'var(--tx-2)', marginTop: '12px', lineHeight: 1.7 }}>
               {apiMissing
                 ? '开源版不含合盘 AI 分析接口（/api/heming），需要你自己实现后才能用。两人的命盘可以分别到「排盘」页（/chart）查看。'
-                : '分析暂时不可用，请重试。'}
+                : `分析失败：${analysisError}`}
             </div>
           )}
         </div>

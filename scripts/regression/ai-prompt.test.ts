@@ -15,7 +15,7 @@ import { buildChartContext, buildHemingContext } from '../../lib/ai/chart-contex
 import { buildHemingSystemPrompt, buildInterpretSystemPrompt } from '../../lib/ai/prompt';
 import { normalizeMessages } from '../../lib/ai/provider';
 import { AiConfigError, resolveAiConfig } from '../../lib/ai/config';
-import { SSE_DONE, SSE_KEEPALIVE, SSE_KEEPALIVE_INTERVAL_MS, createSseStream, sseEvent, sseHeaders } from '../../lib/ai/sse';
+import { SSE_DONE, SSE_KEEPALIVE, SSE_KEEPALIVE_INTERVAL_MS, SSE_STATUS_ACCEPTED, SSE_STATUS_WAITING, createSseStream, sseEvent, sseHeaders } from '../../lib/ai/sse';
 import { sanitizeChinese } from '../../lib/ai/sanitize';
 import { parseChart, trimMessages } from '../../lib/ai/validate';
 import type { ZiweiChart } from '../../lib/ziwei/types';
@@ -171,6 +171,9 @@ ok('真实的省市被保留', good!.birthInfo.province === '北京市' && good!
 // ─── 7) SSE 流的形状（含心跳）───
 ok('心跳间隔不超过 30 秒（边缘空闲超时约 100 秒）',
   SSE_KEEPALIVE_INTERVAL_MS > 0 && SSE_KEEPALIVE_INTERVAL_MS <= 30_000);
+ok('心跳间隔不超过 15 秒（更稳的余量）', SSE_KEEPALIVE_INTERVAL_MS <= 15_000);
+ok('心跳状态事件名已定义', SSE_STATUS_WAITING === 'waiting');
+ok('已受理状态事件名已定义', SSE_STATUS_ACCEPTED === 'accepted');
 
 const streamPromise = (async () => {
   const slow = (async function* () {
@@ -193,6 +196,11 @@ streamPromise.then((all) => {
   ok('心跳行不是 data 行（前端会跳过）', !all.split('\n')[0].startsWith('data: '));
   ok('正文事件格式不变', all.includes('data: {"delta":{"text":"正文"}}'));
   ok('以 [DONE] 结束', all.trim().endsWith('data: [DONE]'));
+  // 光有注释心跳的话，有些中间件不认「响应已经开始」，会在超时点掐断连接，
+  // 前端只看到一个没有解释的 network error。所以开流后要立刻补一个真正的 data 事件。
+  ok('开流后立刻发「已受理」事件', all.includes('data: {"status":"accepted"}'));
+  ok('「已受理」事件排在正文之前', all.indexOf('data: {"status":"accepted"}') < all.indexOf('data: {"delta"'));
+  ok('「已受理」事件紧跟在心跳之后', all.indexOf('data: {"status":"accepted"}') < 64);
 
   if (fails) { console.error(`\n✗ AI 解读纯逻辑回归 ${fails} 项未过`); process.exit(1); }
   console.log('\n✓ AI 解读纯逻辑回归全部通过');

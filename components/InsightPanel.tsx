@@ -3,6 +3,7 @@ import { useState, useRef, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import type { ZiweiChart, Palace } from '@/lib/ziwei/types';
 import type { TimeView } from './TimeNav';
+import { fetchSseText, SseStreamError } from '@/lib/ai/client-stream';
 
 interface Message {
   role: 'user' | 'assistant';
@@ -275,44 +276,46 @@ ${selectedSiHua.starName}化${selectedSiHua.siHua}落在【${palaceName}】，�
   }, [selectedSiHua]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const streamResponse = async (apiMessages: { role: 'user' | 'assistant'; content: string }[]) => {
-    try {
-      const res = await fetch('/api/interpret', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chart, messages: apiMessages }),
+    /** 覆盖最后一条助手消息（流式过程中反复调用） */
+    const updateLastAssistant = (content: string) => {
+      setMessages(prev => {
+        if (prev.length === 0) return [...prev, { role: 'assistant', content }];
+        const updated = [...prev];
+        updated[updated.length - 1] = { role: 'assistant', content };
+        return updated;
       });
-      if (res.status === 404) throw new Error('api-missing');
-      if (!res.ok) throw new Error('请求失败');
-      if (!res.body) throw new Error('无响应流');
+    };
 
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let assistantText = '';
-
+    try {
+      // 先占一个空的助手气泡，流式内容直接往里填
       setMessages(prev => [...prev, { role: 'assistant', content: '' }]);
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const chunk = decoder.decode(value, { stream: true });
-        for (const line of chunk.split('\n')) {
-          if (!line.startsWith('data: ')) continue;
-          const data = line.slice(6);
-          if (data === '[DONE]') break;
-          try {
-            const delta = JSON.parse(data).delta?.text ?? '';
-            assistantText += delta;
-            setMessages(prev => {
-              const updated = [...prev];
-              updated[updated.length - 1] = { role: 'assistant', content: assistantText };
-              return updated;
-            });
-          } catch { /* skip */ }
-        }
-      }
+      await fetchSseText({
+        doFetch: async () => {
+          const res = await fetch('/api/interpret', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chart, messages: apiMessages }),
+          });
+          if (res.status === 404) throw new Error('api-missing');
+          return res;
+        },
+        onDelta: (full) => updateLastAssistant(full),
+        onRetry: (_attempt, _max, reason) => updateLastAssistant(`${reason}，正在重试…`),
+      });
     } catch (e) {
-      const missing = e instanceof Error && e.message === 'api-missing';
-      setMessages(prev => [...prev, { role: 'assistant', content: missing ? '开源版不含 AI 解读接口（/api/interpret），需要你自己实现后才能用，详见 README「快速开始」。排盘本身不需要任何 API Key。' : '解读失败，请稍后重试。' }]);
+      const msg = e instanceof Error ? e.message : '';
+      const missing = msg === 'api-missing';
+      // 真实原因：状态码 + 服务端文案 / 流中断的现场信息
+      const reason = e instanceof SseStreamError ? e.describe() : (missing ? '' : msg);
+      // 覆盖刚才占位的那个助手气泡，保证「一次回应只有一个气泡」
+      updateLastAssistant(
+        missing
+          ? '开源版不含 AI 解读接口（/api/interpret），需要你自己实现后才能用，详见 README「快速开始」。排盘本身不需要任何 API Key。'
+          : reason
+            ? `解读失败：${reason}`
+            : '解读失败，请稍后重试。',
+      );
     } finally {
       setLoading(false);
       loadingRef.current = false;

@@ -26,9 +26,16 @@ export interface GuardOptions {
 
 export const DEFAULT_GUARD_OPTIONS: GuardOptions = {
   windowMs: 60_000,
-  maxPerWindow: 6,
-  maxConcurrent: 2,
-  dailyCap: 60,
+  // 一个人正常逛一个盘面就会连打十几次：
+  //   每次打开 /chart 自动生成一次命格总览 + 每点一个宫位一次 + 每点一个四化一次。
+  // 原来的 6 次/分，普通用户很容易撞上限然后以为「解读坏了」。
+  maxPerWindow: 20,
+  // 前端按钮在请求中会禁用，单用户同时只有 1 个在飞；
+  // 这里留 3 个并发给「同时开两个标签页」的情况。
+  maxConcurrent: 3,
+  // 全站每天的模型调用上限（成本天花板）。
+  // 60 太紧：这一条是**全站共享**的，站点自己做的实测就会把用户的额度吃光。
+  dailyCap: 500,
 };
 
 function toInt(v: string | undefined, fallback: number): number {

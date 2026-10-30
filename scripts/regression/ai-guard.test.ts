@@ -23,9 +23,9 @@ const eq = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 // ─── 1) 配置解析 ───
 const defaults = resolveGuardOptions({});
 ok('默认限流窗口 60 秒', defaults.windowMs === 60_000);
-ok('默认单来源每分钟 6 次', defaults.maxPerWindow === 6);
-ok('默认全局并发 2', defaults.maxConcurrent === 2);
-ok('默认日配额 60 次', defaults.dailyCap === 60);
+ok('默认单来源每分钟 20 次', defaults.maxPerWindow === 20);
+ok('默认全局并发 3', defaults.maxConcurrent === 3);
+ok('默认日配额 500 次', defaults.dailyCap === 500);
 
 const custom = resolveGuardOptions({
   AI_RATE_LIMIT_WINDOW_MS: '5000',
@@ -38,7 +38,7 @@ ok('环境变量覆盖单窗口次数', custom.maxPerWindow === 3);
 ok('环境变量覆盖并发上限', custom.maxConcurrent === 1);
 ok('环境变量覆盖日配额', custom.dailyCap === 10);
 
-ok('非法数值回落到默认值', resolveGuardOptions({ AI_MAX_CONCURRENT: 'abc' }).maxConcurrent === 2);
+ok('非法数值回落到默认值', resolveGuardOptions({ AI_MAX_CONCURRENT: 'abc' }).maxConcurrent === 3);
 ok('零并发被抬到 1（不能把站点锁死）', resolveGuardOptions({ AI_MAX_CONCURRENT: '0' }).maxConcurrent === 1);
 ok('日配额 0 表示不限', resolveGuardOptions({ AI_DAILY_REQUEST_CAP: '0' }).dailyCap === 0);
 ok('默认配置常量与解析结果一致', eq(resolveGuardOptions({}), DEFAULT_GUARD_OPTIONS));
