@@ -28,13 +28,16 @@ export class SseStreamError extends Error {
   readonly elapsedMs: number;
   /** 收到的网络包个数 */
   readonly chunks: number;
+  /** 失败前收到的心跳（服务端状态事件）个数——用来判断服务端是死了还是链路断了 */
+  readonly beats: number;
 
-  constructor(message: string, received: number, elapsedMs: number, chunks: number) {
+  constructor(message: string, received: number, elapsedMs: number, chunks: number, beats = 0) {
     super(message);
     this.name = 'SseStreamError';
     this.received = received;
     this.elapsedMs = elapsedMs;
     this.chunks = chunks;
+    this.beats = beats;
   }
 
   /** 给用户看的一句话（带现场信息，方便排查） */
@@ -43,7 +46,12 @@ export class SseStreamError extends Error {
     const why = this.received > 0
       ? `已收到 ${this.received} 字后连接中断（耗时 ${secs} 秒）`
       : `连接中断，没有收到任何内容（耗时 ${secs} 秒）`;
-    return `${this.message}：${why}`;
+    // 心跳数是判断「服务端挂了」还是「链路断了」的关键：
+    // 收到过心跳说明服务端还在正常说话，是链路/客户端这边断的。
+    const beat = this.beats > 0
+      ? `，断前收到 ${this.beats} 次服务端心跳（服务端仍在响应，是链路中断）`
+      : '，一次心跳都没收到（服务端未开始响应）';
+    return `${this.message}：${why}${beat}`;
   }
 }
 
@@ -73,6 +81,8 @@ export async function readSseText(
   let buffer = '';
   let out = '';
   let chunks = 0;
+  // 服务端心跳（status 事件）计数：断流时能据此判断服务端是否还在响应
+  let beats = 0;
 
   const handleLine = (raw: string) => {
     const line = raw.replace(/\r$/, '');
@@ -93,7 +103,10 @@ export async function readSseText(
     if (typeof delta === 'string' && delta) {
       out += delta;
       onDelta(out);
+      return;
     }
+    // 没有 delta 字段、也没有 error 的事件 = 服务端心跳
+    if (parsed && typeof parsed === 'object') beats++;
   };
 
   try {
@@ -108,6 +121,7 @@ export async function readSseText(
           out.length,
           Date.now() - started,
           chunks,
+          beats,
         );
       }
       if (step.done) break;
@@ -144,18 +158,66 @@ export interface SseFetchOptions {
   maxAttempts?: number;
 }
 
+/** 重试前的退避时间（毫秒）：让请求落到一条新的连接上 */
+const RETRY_BACKOFF_MS = 800;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * 正式请求前先打一个便宜的 GET，把连接「换新」。
+ *
+ * 实测现象：浏览器里发解读请求时，连接可能已经被边缘节点悄悄关掉了
+ * （页面加载完隔一会儿、或中间有别的请求把连接耗掉）。
+ * Chromium 出于安全**不会自动重试 POST**（重试 POST 不幂等），
+ * 于是这个 POST 就直接失败，前端拿到 `TypeError: network error`。
+ *
+ * 而 GET 是幂等的，浏览器遇到断掉的连接会自己重试到新连接上。
+ * 所以先发一个廉价的 GET 让连接焕然一新，后面的 POST 就稳了。
+ *
+ * 这一步失败也无所谓——它只是暖连接，正式请求仍会照常发起并自己重试。
+ */
+export async function primeConnection(): Promise<void> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 2500);
+    await fetch('/api/health?prime=1', { method: 'GET', cache: 'no-store', signal: controller.signal });
+    clearTimeout(timer);
+  } catch {
+    // 暖连接失败不影响主流程
+  }
+}
+
 /**
  * 发起一次 SSE 请求并读完。
  *
  * 「一个字都没收到就重试」是有意为之：
  *   - 完全没收到 → 多半是连接被掐断，重试一次大概率能成；
  *   - 已经收到一部分 → 重试会产生两份内容，反而更糟，直接把已有的部分和错误一起显示出来。
+ *
+ * 实测 Cloudflare 的 HTTP/2 链路会**间歇性**把长连接掐掉（服务端还在好好发心跳，
+ * 客户端这边直接 network error），掐掉的概率不低。所以默认给 3 次机会，
+ * 而且每次重试前都重新暖一次连接——立刻重试很可能还落在同一条坏连接上。
  */
 export async function fetchSseText(opts: SseFetchOptions): Promise<string> {
-  const maxAttempts = Math.max(1, opts.maxAttempts ?? 2);
+  const maxAttempts = Math.max(1, opts.maxAttempts ?? 3);
 
   for (let attempt = 1; ; attempt++) {
-    const res = await opts.doFetch();
+    // 先暖连接，避免这个 POST 落在已被关闭的连接上
+    await primeConnection();
+
+    let res: Response;
+    try {
+      res = await opts.doFetch();
+    } catch (e) {
+      // fetch 本身失败（连接被掐在响应头之前）
+      if (attempt >= maxAttempts) throw e;
+      opts.onRetry?.(attempt, maxAttempts - 1, e instanceof Error ? e.message : '连接失败');
+      await sleep(RETRY_BACKOFF_MS);
+      continue;
+    }
+
     if (!res.ok) {
       // 非 2xx 是明确的失败（限流 / 没配 Key / 网关错误），不重试
       throw new Error(await describeHttpError(res));
@@ -173,6 +235,8 @@ export async function fetchSseText(opts: SseFetchOptions): Promise<string> {
 
       const reason = e.describe();
       opts.onRetry?.(attempt, maxAttempts - 1, reason);
+      // 退一下再试：立刻重试很可能还落在同一条坏连接上
+      await sleep(RETRY_BACKOFF_MS);
     }
   }
 }

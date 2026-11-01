@@ -16,7 +16,6 @@ export function sseHeaders(): Record<string, string> {
   return {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache, no-transform',
-    'Connection': 'keep-alive',
     // 关掉 nginx 之类的缓冲，否则增量会被攒成一坨
     'X-Accel-Buffering': 'no',
   };
@@ -57,8 +56,17 @@ export const SSE_STATUS_ACCEPTED = 'accepted';
  */
 export const SSE_STATUS_WAITING = 'waiting';
 
-/** 心跳间隔（毫秒）。边缘节点的空闲超时通常是 100 秒，10 秒足够安全。 */
-export const SSE_KEEPALIVE_INTERVAL_MS = 10_000;
+/**
+ * 心跳间隔（毫秒）。
+ *
+ * **不要调回 10 秒。**实测浏览器（Chromium / Electron）在「响应头已到、但正文迟迟不来」
+ * 时，大约 5 秒没有收到任何响应体数据就会把连接掐掉，表现为前端拿到
+ * `TypeError: network error`——服务端明明还在好好地发心跳。
+ *
+ * 带 thinking 的模型首字可能几十秒才来（实测长 prompt 首字 >50 秒），
+ * 所以心跳必须明显短于这个阈值。2.5 秒一次，每次几十字节，代价可以忽略。
+ */
+export const SSE_KEEPALIVE_INTERVAL_MS = 2_500;
 
 /**
  * 把一个「逐段吐文本」的异步生成器包装成 SSE 响应体。

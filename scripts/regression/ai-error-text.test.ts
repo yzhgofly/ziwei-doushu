@@ -13,6 +13,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { describeHttpError, describeStreamError } from '../../lib/ai/error-text';
 import { readSseText, fetchSseText, SseStreamError } from '../../lib/ai/client-stream';
+import { SSE_KEEPALIVE_INTERVAL_MS } from '../../lib/ai/sse';
 
 let fails = 0;
 function ok(name: string, cond: boolean) {
@@ -223,6 +224,50 @@ async function main() {
       ok('已经收到正文后不再重试', calls === 1);
       ok('已经收到正文后抛出 SseStreamError', err instanceof SseStreamError);
     }
+  }
+
+  // ─── 5) 心跳频率 + 暖连接 ───
+  // 实测 Chromium / Electron 在响应体 5 秒没数据时就把连接掐了，
+  // 表现是前端拿到没有解释的 network error，而服务端还在好好发心跳。
+  {
+    ok('心跳间隔短于 5 秒', SSE_KEEPALIVE_INTERVAL_MS < 5000);
+    ok('心跳间隔不短于 1 秒（别把带宽打满）', SSE_KEEPALIVE_INTERVAL_MS >= 1000);
+
+    const sseSrc = readFileSync(join(ROOT, 'lib/ai/sse.ts'), 'utf8');
+    ok('开流立刻发一个真正的 data 事件', sseSrc.includes('SSE_STATUS_ACCEPTED'));
+    ok('心跳同时发真正的 data 事件', sseSrc.includes('SSE_STATUS_WAITING'));
+    ok('心跳注释行还在', sseSrc.includes('SSE_KEEPALIVE'));
+  }
+
+  // ─── 6) 正式请求前先暖连接 ───
+  // Chromium 不会自动重试 POST；连接若已被边缘节点关掉，POST 会直接失败。
+  // 先发一个幂等 GET 让浏览器自己换一条新连接。
+  {
+    const order: string[] = [];
+    const origFetch = globalThis.fetch;
+    const goodSse = () => new Response(
+      'data: {"delta":{"text":"好"}}\n\ndata: [DONE]\n\n',
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    );
+    (globalThis as any).fetch = async (url: any, init?: any) => {
+      order.push(`GET ${String(url)}`);
+      return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+    };
+    try {
+      await fetchSseText({
+        doFetch: async () => {
+          order.push('POST /api/interpret');
+          return goodSse();
+        },
+        onDelta: () => {},
+      });
+    } finally {
+      (globalThis as any).fetch = origFetch;
+    }
+    ok('正式请求前先发了一次暖连接请求', order.length === 2);
+    ok('暖连接请求打的是 /api/health', order[0]?.includes('/api/health') === true);
+    ok('暖连接用的是幂等 GET（浏览器才会自动重试）', order[0]?.startsWith('GET') === true);
+    ok('正式请求排在暖连接之后', order[1]?.startsWith('POST') === true);
   }
 
   if (fails > 0) {

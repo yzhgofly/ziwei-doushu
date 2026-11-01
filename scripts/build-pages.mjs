@@ -86,6 +86,7 @@ async function bundleFunctions() {
     path.join(srcFunctionsDir, 'api', 'interpret.ts'),
     path.join(srcFunctionsDir, 'api', 'heming.ts'),
     path.join(srcFunctionsDir, 'api', 'health.ts'),
+    path.join(srcFunctionsDir, 'api', 'history.ts'),
   ];
 
   for (const entry of entries) {
@@ -127,10 +128,17 @@ async function main() {
   await bundleFunctions();
 
   // 3) wrangler 配置（Pages 用 pages_build_output_dir 指静态产物目录）
+  //    kv_namespaces 里的绑定会随 `wrangler pages deploy` 一起生效，
+  //    /api/history 靠它拿到 Cloudflare KV（存的是客户端加密后的密文）。
+  const kvNamespaceId = process.env.CF_HISTORY_KV_ID || 'd0d378fb6d9a41ff94514a90c9c4abc6';
   const wranglerToml = `name = "ziwei-doushu"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 pages_build_output_dir = "out"
+
+[[kv_namespaces]]
+binding = "HISTORY_KV"
+id = "${kvNamespaceId}"
 `;
   writeFileSync(path.join(root, 'wrangler.toml'), wranglerToml, 'utf8');
 

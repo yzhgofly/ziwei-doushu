@@ -1,11 +1,13 @@
 'use client';
-import { useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import BirthForm from '@/components/BirthForm';
 import ChartBoard from '@/components/ChartBoard';
 import InsightPanel from '@/components/InsightPanel';
+import HistoryPanel from '@/components/HistoryPanel';
 import TimeNav, { type TimeView } from '@/components/TimeNav';
 import { generateChart } from '@/lib/ziwei/algorithm';
 import type { BirthInfo, ZiweiChart, Palace } from '@/lib/ziwei/types';
+import { RESTORE_EVENT, takeStagedChart } from '@/lib/history/restore';
 
 /**
  * 命盘页 —— 开源版「排盘引擎 Demo」
@@ -23,6 +25,35 @@ export default function ChartPage() {
   const [view, setView] = useState<TimeView>('mingpan');
   const [liunianYear, setLiunianYear] = useState(() => new Date().getFullYear());
 
+  // ── 从历史记录恢复现场 ──
+  // 两种来源都要接住：
+  //   1. 整页跳过来（?restore=1 + sessionStorage 暂存盘）
+  //   2. 同一页内换盘（历史面板派发 RESTORE_EVENT，路由不变、组件不重挂载）
+  const applyRestoredChart = useCallback((restored: ZiweiChart) => {
+    setChart(restored);
+    setSelectedPalace(null);
+    // 去掉 ?restore=1，免得下次进来又自动恢复
+    try {
+      if (window.location.search.includes('restore=1')) {
+        window.history.replaceState({}, '', window.location.pathname);
+      }
+    } catch { /* 忽略 */ }
+  }, []);
+
+  useEffect(() => {
+    const onRestore = (e: Event) => {
+      const restored = (e as CustomEvent<ZiweiChart>).detail;
+      if (!restored) return;
+      takeStagedChart();  // 同页恢复：把暂存那份清掉，别留着影响下次
+      applyRestoredChart(restored);
+    };
+    window.addEventListener(RESTORE_EVENT, onRestore);
+    // 整页跳过来的：取走暂存的盘
+    const staged = takeStagedChart();
+    if (staged) applyRestoredChart(staged);
+    return () => window.removeEventListener(RESTORE_EVENT, onRestore);
+  }, [applyRestoredChart]);
+
   // ── 未起盘：展示出生信息表单 ──
   if (!chart) {
     return (
@@ -33,7 +64,11 @@ export default function ChartPage() {
           <br />
           （本页为引擎 Demo，完整商业版界面不在开源范围；排盘内核完全开放。）
         </p>
-        <BirthForm onSubmit={(info: BirthInfo) => setChart(generateChart(info))} />
+        {/* 未起盘时也能看到历史：直接回看以前的解读，或一键恢复当时的命盘 */}
+        <HistoryPanel />
+        <div style={{ marginTop: '20px' }}>
+          <BirthForm onSubmit={(info: BirthInfo) => setChart(generateChart(info))} />
+        </div>
       </main>
     );
   }

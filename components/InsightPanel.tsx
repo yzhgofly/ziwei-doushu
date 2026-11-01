@@ -4,6 +4,8 @@ import { motion, AnimatePresence } from 'framer-motion';
 import type { ZiweiChart, Palace } from '@/lib/ziwei/types';
 import type { TimeView } from './TimeNav';
 import { fetchSseText, SseStreamError } from '@/lib/ai/client-stream';
+import HistoryPanel from './HistoryPanel';
+import { recordHistory } from '@/lib/history/record';
 
 interface Message {
   role: 'user' | 'assistant';
@@ -210,7 +212,7 @@ export default function InsightPanel({ chart, selectedPalace, selectedSiHua }: I
   useEffect(() => {
     if (autoLoaded.current) return;
     autoLoaded.current = true;
-    sendMessage(TOPIC_PROMPTS.overview, true);
+    sendMessage(TOPIC_PROMPTS.overview, true, '命格');
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Inject palace analysis when palace selected
@@ -238,7 +240,7 @@ ${selectedPalace.name}在命盘中的意义，以及这种星曜配置的整体�
 **【实际建议】**
 基于此宫的具体建议。`;
 
-    sendMessage(prompt, true);
+    sendMessage(prompt, true, `【${selectedPalace.name}】`);
   }, [selectedPalace]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // 注入四化飞化分析
@@ -272,10 +274,13 @@ ${selectedSiHua.starName}化${selectedSiHua.siHua}落在【${palaceName}】，�
 **【实际建议】**
 基于此四化的具体可操作建议。`;
 
-    sendMessage(prompt, true);
+    sendMessage(prompt, true, `【${viewLabel}${selectedSiHua.starName}化${selectedSiHua.siHua}】`);
   }, [selectedSiHua]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const streamResponse = async (apiMessages: { role: 'user' | 'assistant'; content: string }[]) => {
+  const streamResponse = async (
+    apiMessages: { role: 'user' | 'assistant'; content: string }[],
+    label: string,
+  ) => {
     /** 覆盖最后一条助手消息（流式过程中反复调用） */
     const updateLastAssistant = (content: string) => {
       setMessages(prev => {
@@ -285,6 +290,9 @@ ${selectedSiHua.starName}化${selectedSiHua.siHua}落在【${palaceName}】，�
         return updated;
       });
     };
+
+    // 记录流式过程中收到的完整正文，成功后写进历史
+    let finalText = '';
 
     try {
       // 先占一个空的助手气泡，流式内容直接往里填
@@ -300,8 +308,16 @@ ${selectedSiHua.starName}化${selectedSiHua.siHua}落在【${palaceName}】，�
           if (res.status === 404) throw new Error('api-missing');
           return res;
         },
-        onDelta: (full) => updateLastAssistant(full),
+        onDelta: (full) => { finalText = full; updateLastAssistant(full); },
         onRetry: (_attempt, _max, reason) => updateLastAssistant(`${reason}，正在重试…`),
+      });
+
+      // 成功出字 → 存进本机历史（只存本机，不发服务器）
+      recordHistory({
+        kind: 'interpret',
+        question: label,
+        answer: finalText,
+        chart,
       });
     } catch (e) {
       const msg = e instanceof Error ? e.message : '';
@@ -322,7 +338,7 @@ ${selectedSiHua.starName}化${selectedSiHua.siHua}落在【${palaceName}】，�
     }
   };
 
-  const sendMessage = (text: string, hidden = false) => {
+  const sendMessage = (text: string, hidden = false, label?: string) => {
     if (!text.trim() || loadingRef.current) return;
     loadingRef.current = true;
     setLoading(true);
@@ -336,13 +352,16 @@ ${selectedSiHua.starName}化${selectedSiHua.siHua}落在【${palaceName}】，�
 
     setMessages(prev => [...prev, userMsg]);
     setInput('');
-    streamResponse(apiMessages);
+    // 展示用标签：没给就用提问原文的前 40 字
+    const historyLabel = (label || text).replace(/\s+/g, ' ').trim().slice(0, 40);
+    streamResponse(apiMessages, historyLabel);
   };
 
   const handleTopicClick = (topicKey: string) => {
     if (loadingRef.current) return;
     setActiveTopic(topicKey);
-    sendMessage(TOPIC_PROMPTS[topicKey], true);
+    const topic = TOPICS.find(t => t.key === topicKey);
+    sendMessage(TOPIC_PROMPTS[topicKey], true, topic?.label || '命格');
   };
 
   const handleSend = () => {
@@ -351,6 +370,9 @@ ${selectedSiHua.starName}化${selectedSiHua.siHua}落在【${palaceName}】，�
 
   return (
     <div className="flex flex-col h-full rounded-xl overflow-hidden card-glass">
+
+      {/* ── 历史记录（只存本机，别人看不到）── */}
+      <HistoryPanel compact />
 
       {/* ── Topic buttons ── */}
       <div className="flex-shrink-0 px-2 pt-2.5 pb-2" style={{ borderBottom: '1px solid var(--t-border)' }}>

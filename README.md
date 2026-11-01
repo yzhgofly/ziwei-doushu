@@ -287,7 +287,7 @@ npm run dev
 
 ```bash
 npm run typecheck   # TypeScript 全量类型检查
-npm test            # 排盘引擎回归（768 盘 × 紫微铁律、夏令时、立春边界、红鸾天喜、样本时辰一致性、时辰序号边界、日期合法性、同宫双四化）+ AI 解读纯逻辑回归
+npm test            # 排盘引擎回归（768 盘 × 紫微铁律、夏令时、立春边界、红鸾天喜、样本时辰一致性、时辰序号边界、日期合法性、同宫双四化）+ AI 解读纯逻辑回归 + 历史记录回归（本地存储 / 加密 / 接口隐私模型 / 前端接线）
 ```
 
 每次 push 与 PR 都会在 GitHub Actions 上跑同一套（见 [`.github/workflows/ci.yml`](./.github/workflows/ci.yml)）。
@@ -392,7 +392,64 @@ allowedDevOrigins: ['*.trycloudflare.com'],
 
 用通配符是为了兼容隧道每次重启都会变的随机域名；换成自己的域名，把通配符换成具体域名即可（改完要重启 dev server）。正式部署用 `next build && next start` 则不受此限制。
 
-**SSE 心跳**：解读是流式返回的，模型思考可能要一两分钟。这期间如果一个字节都不发，经过 CDN 时会被边缘节点掐断（Cloudflare 表现为 `524`，或者返回 200 但正文 0 字）。所以实现里在流的**开头**和**生成期间每 15 秒**各发一行 SSE 注释心跳（`: open`），把连接保持活着；前端按 `data: ` 前缀过滤，会直接跳过这些注释行。
+**SSE 心跳**：解读是流式返回的，模型思考可能要几十秒。这期间如果响应体里一个字节都不来，浏览器（Chromium / Electron）大约 5 秒就会把连接掐掉，表现为前端拿到一个没有解释的 `TypeError: network error`——服务端明明还在正常跑。所以实现里在流的**开头**立刻发一个真正的 data 事件（`{"status":"accepted"}`），并在**生成期间每 2.5 秒**发一次心跳（`: open` 注释行 + 一个真正的 `{"status":"waiting"}` 事件）。注释行有些中间件不认，只发注释的话它们可能在超时点直接掐断连接；真正的事件能保证任何一层都不会误判「响应已经开始」。前端会忽略没有 `delta` / `error` 字段的事件。
+
+**发请求前先暖连接**：解读是 POST，Chromium 出于安全**不会自动重试 POST**（重试 POST 不幂等）。如果连接已经被边缘节点悄悄关掉，这个 POST 就会直接失败。所以正式请求前先打一个廉价的 `GET /api/health`——GET 是幂等的，浏览器遇到断掉的连接会自己重试到新连接上，后面的 POST 就落在一条好连接上了（见 `lib/ai/client-stream.ts` 的 `primeConnection`）。再加上「一个字都没收到就自动重试一次」，双保险。
+
+### 历史记录（默认只存本机，别人看不到）
+
+每次解读或合盘出字后，问答会自动存进**你自己浏览器**的本地存储，解读面板、合盘页、以及 `/chart` 未起盘时的页面顶部都能展开查看：列表、展开看全文、「回到这个命盘」接着追问、单条删除、导出 / 导入 JSON。
+
+**隐私模型**（这是这个功能的核心）：
+
+| | 存在哪 | 别人能不能看到 |
+|---|---|---|
+| 本地历史（默认） | 你这台设备的 `localStorage` | **不能**。数据压根没离开设备，服务器完全不知道 |
+| 云备份（可选） | Cloudflare KV / Upstash | **不能**。存上去的是**客户端加密后的密文**，服务器没有同步码就解不开 |
+
+云备份的加密在**浏览器里**完成：同步码经 PBKDF2-SHA256（20 万次）派生 AES-GCM-256 密钥，正文加密后才上传。服务器上只有密文，以及一个由同步码另一次 PBKDF2 派生（10 万次）出来的存放位置——同步码明文不上传，服务器也没有解密手段。
+
+所以「本地那一份才是本体」：**同步码丢了只是云端备份取不回，本地历史不受影响**。同步码可以一键生成（24 字节随机 = 192 位熵），也可以自己写口令（至少 12 个字符）。
+
+| 文件 | 作用 |
+|---|---|
+| `lib/history/types.ts` | 数据模型、上限常量、同步码请求头名 |
+| `lib/history/local.ts` | 本地存储层：读写、条数/体积双上限、导入导出、变更事件 |
+| `lib/history/crypto.ts` | PBKDF2 + AES-GCM 封装（加密、解密、随机同步码） |
+| `lib/history/cloud.ts` | 云备份客户端：上传 / 下载 / 删除 / 探测 |
+| `lib/history/kv-store.ts` | KV 抽象：Cloudflare 绑定 / Upstash REST / Cloudflare REST 三种后端 |
+| `lib/history/history-api.ts` | `/api/history` 共享处理器（Next 路由与 Pages Functions 共用） |
+| `lib/history/record.ts` | 写历史的统一入口 |
+| `lib/history/restore.ts` | 把历史里的命盘暂存到 `sessionStorage`，供 `/chart` 恢复现场 |
+| `components/HistoryPanel.tsx` | 历史面板（列表 / 全文 / 导出导入 / 云备份开关） |
+| `app/api/history/route.ts`、`functions-src/api/history.ts` | 两个部署目标的接口入口 |
+
+容量上限：本地最多 **30 条**、总体积不超过 **2 MB**，超了从最旧的一条开始丢。`/api/history` 自带 30 次/分的单 IP 闸，不占用 AI 解读的日配额。
+
+「回到这个命盘」有两种路径都覆盖了：从合盘页跳回排盘页（走 `sessionStorage` 暂存 + `?restore=1`），以及**已经在排盘页时换回另一张盘**（路由不变、组件不会重挂载，所以额外派发一个窗口事件直接换盘）。恢复后会自动把 `?restore=1` 从地址栏去掉，免得下次进来又自动恢复。
+
+**开启云备份**（可选，不开也完全能用）：
+
+```bash
+# 1) 建 KV 命名空间
+wrangler kv namespace create HISTORY_KV
+#    记下返回的 namespace id
+
+# 2) 绑定到 Pages 项目（两种方式任选）
+#    a) wrangler.toml 里写（scripts/build-pages.mjs 会自动写进去）：
+#       [[kv_namespaces]]
+#       binding = "HISTORY_KV"
+#       id = "<namespace-id>"
+#    b) 或者用 Cloudflare API 写进项目设置：
+#       PATCH /accounts/{account}/pages/projects/{project}
+#       {"deployment_configs":{"production":{"kv_namespaces":{"HISTORY_KV":{"namespace_id":"<id>"}}}}}
+
+# 3) 部署
+npm run build:pages
+wrangler pages deploy out --project-name ziwei-doushu
+```
+
+Vercel 侧没有 Cloudflare 绑定，可以改用 Upstash（`KV_REST_API_URL` + `KV_REST_API_TOKEN`）或 Cloudflare KV 的 REST 接口（`CF_ACCOUNT_ID` + `CF_KV_NAMESPACE_ID` + `CF_API_TOKEN`）。**都不配也不影响使用**——本地历史照常工作，面板会提示「当前部署没有启用云备份」。
 
 ### 部署到 Cloudflare Pages（`pages.dev` 在大陆可直接访问）
 

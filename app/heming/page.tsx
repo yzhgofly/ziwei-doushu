@@ -7,6 +7,8 @@ import { generateChart as buildChart } from '@/lib/ziwei/algorithm';
 import type { BirthInfo, ZiweiChart } from '@/lib/ziwei/types';
 import { useTheme } from '@/components/ThemeProvider';
 import { fetchSseText, SseStreamError } from '@/lib/ai/client-stream';
+import HistoryPanel from '@/components/HistoryPanel';
+import { recordHistory } from '@/lib/history/record';
 
 // ─── AiContent 渲染器（与 InsightPanel 一致）────────────────
 function AiContent({ text, streaming }: { text: string; streaming?: boolean }) {
@@ -99,6 +101,9 @@ export default function HemingPage() {
     setAnalysisError(null);
     setRetryNote(null);
 
+    // 本次回答的完整正文（成功后写进历史）
+    let finalText = '';
+
     try {
       // 并行起两张盘（如果还没起）
       let cA = chartA;
@@ -127,9 +132,19 @@ export default function HemingPage() {
           if (res.status === 404) { setApiMissing(true); throw new Error('api-missing'); }
           return res;
         },
-        onDelta: (full) => { setRetryNote(null); setAnalysis(full); },
+        onDelta: (full) => { finalText = full; setRetryNote(null); setAnalysis(full); },
         onRetry: (_attempt, _max, reason) => setRetryNote(`${reason}，正在重试…`),
       });
+
+      // 成功出字 → 存进本机历史（只存本机，不发服务器）
+      recordHistory({
+        kind: 'heming',
+        question: q ? q.trim() : '综合合盘分析',
+        answer: finalText,
+        chart: cA,
+        chartB: cB,
+      });
+
       // scroll to analysis
       setTimeout(() => analysisRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100);
     } catch (e) {
@@ -196,6 +211,11 @@ export default function HemingPage() {
           <p style={{ fontSize: '13px', color: 'var(--tx-3)', lineHeight: 1.6 }}>
             输入两个人的出生信息，AI 基于倪海厦体系分析双方命盘的缘分匹配度、感情走向与相处建议
           </p>
+        </div>
+
+        {/* 历史记录（只存本机，别人看不到） */}
+        <div style={{ marginBottom: '24px' }}>
+          <HistoryPanel />
         </div>
 
         {/* 双栏表单 */}
