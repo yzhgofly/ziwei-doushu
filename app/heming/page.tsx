@@ -123,14 +123,11 @@ export default function HemingPage() {
       if (!chartB) setChartB(cB);
 
       await fetchSseText({
-        doFetch: async () => {
-          const res = await fetch('/api/heming', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ chartA: cA, chartB: cB, question: q ?? undefined }),
-          });
-          if (res.status === 404) { setApiMissing(true); throw new Error('api-missing'); }
-          return res;
+        request: {
+          url: '/api/heming',
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chartA: cA, chartB: cB, question: q ?? undefined }),
         },
         onDelta: (full) => { finalText = full; setRetryNote(null); setAnalysis(full); },
         onRetry: (_attempt, _max, reason) => setRetryNote(`${reason}，正在重试…`),
@@ -151,7 +148,8 @@ export default function HemingPage() {
       const msg = e instanceof Error ? e.message : '';
       setRetryNote(null);
       if (msg === 'api-missing') {
-        // 404 由 apiMissing 分支单独提示
+        // 404：这个部署没有 /api/heming，单独提示（不再重试）
+        setApiMissing(true);
       } else {
         // 真实原因：状态码 + 服务端文案 / 流中断的现场信息
         setAnalysisError(e instanceof SseStreamError ? e.describe() : (msg || '分析失败，请稍后重试。'));

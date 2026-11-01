@@ -396,6 +396,8 @@ allowedDevOrigins: ['*.trycloudflare.com'],
 
 **发请求前先暖连接**：解读是 POST，Chromium 出于安全**不会自动重试 POST**（重试 POST 不幂等）。如果连接已经被边缘节点悄悄关掉，这个 POST 就会直接失败。所以正式请求前先打一个廉价的 `GET /api/health`——GET 是幂等的，浏览器遇到断掉的连接会自己重试到新连接上，后面的 POST 就落在一条好连接上了（见 `lib/ai/client-stream.ts` 的 `primeConnection`）。再加上「一个字都没收到就自动重试」，双保险。
 
+**Safari（WebKit）上的特殊处理**：`fetch()` 的流式响应在 WebKit 上有个已知缺陷（[WebKit Bug 322545](https://bugs.webkit.org/show_bug.cgi?id=322545)，Safari 26 / macOS 26）——当页面增量读取响应体时，**被扣下的字节只有服务端再发数据时才会释放**，而且「**流安静下来后最后一段永远送不到**」。我们服务端最后一条 `data: [DONE]` 正好属于「安静下来后不再有数据」的那一段，于是 Safari 会一直等不到结束标记，表现为解读卡住、最后超时失败。Chrome 和 Firefox 不受影响（内置浏览器是 Chromium 内核，所以它不受这条影响）。实现里检测到 WebKit（桌面 Safari、iOS 上的所有浏览器）就改用 `XMLHttpRequest` 读流：它的 `onprogress` 是「服务器给了多少就给多少」，不依赖 ReadableStream 的拉取模型，末帧能可靠收到。
+
 **已知问题：Chromium 侧偶发的「首连断流」**。在部分网络环境下，浏览器**第一次**发解读请求时连接会在几秒后被掐断（前端报 `TypeError: network error`），但同一接口在 Node、curl、直连、走本地代理、HTTP/1.1、HTTP/2、IPv4、IPv6 各种组合下都能完整收完——说明**服务端是健康的，问题在浏览器这条连接上**。目前靠上面的「暖连接 + 自动重试」兜底：用户看到的是一次「正在重试…」的提示，随后正文正常流出来。因为断流发生在模型吐字之前、此时上游模型请求也会被一并中止，所以不会白白烧掉 token 配额。
 
 ### 历史记录（默认只存本机，别人看不到）

@@ -12,7 +12,7 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { describeHttpError, describeStreamError } from '../../lib/ai/error-text';
-import { readSseText, fetchSseText, SseStreamError } from '../../lib/ai/client-stream';
+import { readSseText, readSseXhr, fetchSseText, prefersXhrTransport, SseStreamError } from '../../lib/ai/client-stream';
 import { SSE_KEEPALIVE_INTERVAL_MS } from '../../lib/ai/sse';
 
 let fails = 0;
@@ -77,6 +77,7 @@ async function main() {
     const src = readFileSync(path, 'utf8');
     ok(`${label} 引入了共用的流读取器`, src.includes("from '@/lib/ai/client-stream'"));
     ok(`${label} 用 fetchSseText 读流`, src.includes('fetchSseText({'));
+    ok(`${label} 传了统一的请求描述（WebKit 才有 XHR 通道可用）`, src.includes('request: {'));
     ok(`${label} 不再自己手写 fetch 分片解析`, !src.includes("chunk.split('\\n')"));
     ok(`${label} 不再把错误直接 throw 成空 Error`, !/throw new Error\(\s*\)\s*;/.test(src));
   }
@@ -88,6 +89,8 @@ async function main() {
     ok('流读取器会抛出服务端报的 error 事件', src.includes('describeStreamError(parsed)'));
     ok('流读取器带现场诊断信息（字数 / 耗时 / 包数）', src.includes('elapsedMs') && src.includes('chunks'));
     ok('流读取器一个字节都没收到时会重试', src.includes('received > 0'));
+    ok('流读取器有 XHR 通道（绕开 WebKit 的 fetch 字节流缺陷）', src.includes('readSseXhr'));
+    ok('流读取器会识别 WebKit 并切通道', src.includes('prefersXhrTransport'));
   }
 
   // ─── 6) 合盘页必须展示真实原因，而不是固定文案 ───
@@ -268,6 +271,83 @@ async function main() {
     ok('暖连接请求打的是 /api/health', order[0]?.includes('/api/health') === true);
     ok('暖连接用的是幂等 GET（浏览器才会自动重试）', order[0]?.startsWith('GET') === true);
     ok('正式请求排在暖连接之后', order[1]?.startsWith('POST') === true);
+  }
+
+  // ─── 7) Safari / WebKit 走 XHR 通道 ───
+  // WebKit Bug 322545：流式 fetch() 响应体在 reader 忙时会被 WebKit 扣住，
+  // 只有服务端再发数据才会释放；流安静下来后最后一段（我们的 data: [DONE]）永远送不到。
+  // Safari 于是表现为「解读卡住 / 失败」，而 Chrome / Firefox 完全正常。
+  // 所以 WebKit 上改走 XMLHttpRequest（onprogress 是有数据就推，不依赖拉取模型）。
+  {
+    const SAFARI = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15';
+    ok('桌面版 Safari 走 XHR 通道', prefersXhrTransport(SAFARI));
+    ok('桌面版 Chrome 继续走 fetch 通道', !prefersXhrTransport('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36'));
+    ok('Edge 继续走 fetch 通道', !prefersXhrTransport('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36 Edg/148.0.0.0'));
+    ok('Android Chrome 继续走 fetch 通道', !prefersXhrTransport('Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Mobile Safari/537.36'));
+    ok('iOS 版 Chrome（内核仍是 WebKit）走 XHR 通道', prefersXhrTransport('Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/148.0.0.0 Mobile/15E148 Safari/604.1'));
+    ok('iOS 版 Edge（内核仍是 WebKit）走 XHR 通道', prefersXhrTransport('Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) EdgiOS/148.0.0.0 Mobile/15E148 Safari/605.1.15'));
+
+    // 造一个假的 XMLHttpRequest
+    let lastXhr: any = null;
+    class FakeXhr {
+      status = 200;
+      responseText = '';
+      opened = '';
+      onprogress: (() => void) | null = null;
+      onload: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      ontimeout: (() => void) | null = null;
+      onabort: (() => void) | null = null;
+      constructor() { lastXhr = this; }
+      open(method: string, url: string) { this.opened = `${method} ${url}`; }
+      setRequestHeader() { /* 记录即可 */ }
+      send() { /* 测试里手动推数据 */ }
+      push(text: string) { this.responseText += text; this.onprogress?.(); }
+      finish() { this.onload?.(); }
+    }
+
+    const origXhr = (globalThis as any).XMLHttpRequest;
+    (globalThis as any).XMLHttpRequest = FakeXhr;
+    try {
+      // XHR 通道：分片边界不丢内容 + 末帧（DONE）能收到
+      let out = '';
+      const p = readSseXhr({ url: '/api/interpret', method: 'POST', body: '{}' }, (full) => { out = full; });
+      ok('XHR 通道用 POST 发到正确的地址', lastXhr?.opened === 'POST /api/interpret');
+      lastXhr.push('data: {"delta":{"text":"你');
+      lastXhr.push('好"}}\n\ndata: [DONE]\n\n');
+      lastXhr.finish();
+      const full = await p;
+      ok('XHR 通道能拼回被切开的 SSE 行', full === '你好');
+      ok('XHR 通道能收到结束标记（不会把客户端吊在半空）', out === '你好');
+
+      // WebKit UA 下，fetchSseText 应该走 XHR 而不是 fetch
+      const origNav = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+      const origFetch = globalThis.fetch;
+      const fetched: string[] = [];
+      (globalThis as any).fetch = async (url: any) => {
+        fetched.push(String(url));
+        return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+      };
+      Object.defineProperty(globalThis, 'navigator', { value: { userAgent: SAFARI }, configurable: true, writable: true });
+      try {
+        lastXhr = null;
+        const p2 = fetchSseText({
+          request: { url: '/api/interpret', method: 'POST', body: '{}' },
+          onDelta: () => {},
+        });
+        await new Promise((r) => setTimeout(r, 0));
+        lastXhr?.push('data: {"delta":{"text":"Safari 好"}}\n\ndata: [DONE]\n\n');
+        lastXhr?.finish();
+        const full2 = await p2;
+        ok('WebKit 上 fetchSseText 走 XHR 通道并能读完整段', full2 === 'Safari 好');
+        ok('WebKit 上正式请求没有经过 fetch', !fetched.some((u) => u.includes('/api/interpret')));
+      } finally {
+        Object.defineProperty(globalThis, 'navigator', origNav as PropertyDescriptor);
+        (globalThis as any).fetch = origFetch;
+      }
+    } finally {
+      (globalThis as any).XMLHttpRequest = origXhr;
+    }
   }
 
   if (fails > 0) {

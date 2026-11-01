@@ -6,12 +6,16 @@
  * 这里把状态码和服务端返回的 JSON 里的 error 字段原样带出来。
  */
 
-/** 从失败的响应里读出最有用的那一句原因 */
-export async function describeHttpError(res: Response): Promise<string> {
-  const status = res.status;
+/**
+ * 把状态码 + 响应体整理成一句能看懂的中文。
+ *
+ * fetch 通道和 XHR 通道都要用，所以单独抽出来，
+ * 保证两条通道给用户看到的文案完全一致。
+ */
+export function formatHttpError(status: number, statusText: string, body: string): string {
   let detail = '';
   try {
-    detail = (await res.text()).slice(0, 500);
+    detail = (body ?? '').slice(0, 500);
   } catch {
     detail = '';
   }
@@ -30,7 +34,18 @@ export async function describeHttpError(res: Response): Promise<string> {
 
   const prefix = `HTTP ${status}`;
   if (serverMsg) return `${prefix}：${serverMsg}`;
-  return `${prefix}（${res.statusText || '请求失败'}）`;
+  return `${prefix}（${statusText || '请求失败'}）`;
+}
+
+/** 从失败的响应里读出最有用的那一句原因 */
+export async function describeHttpError(res: Response): Promise<string> {
+  let body = '';
+  try {
+    body = await res.text();
+  } catch {
+    body = '';
+  }
+  return formatHttpError(res.status, res.statusText, body);
 }
 
 /** SSE 流里服务端发来的 error 事件 */

@@ -299,14 +299,11 @@ ${selectedSiHua.starName}化${selectedSiHua.siHua}落在【${palaceName}】，�
       setMessages(prev => [...prev, { role: 'assistant', content: '' }]);
 
       await fetchSseText({
-        doFetch: async () => {
-          const res = await fetch('/api/interpret', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ chart, messages: apiMessages }),
-          });
-          if (res.status === 404) throw new Error('api-missing');
-          return res;
+        request: {
+          url: '/api/interpret',
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chart, messages: apiMessages }),
         },
         onDelta: (full) => { finalText = full; updateLastAssistant(full); },
         onRetry: (_attempt, _max, reason) => updateLastAssistant(`${reason}，正在重试…`),
