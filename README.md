@@ -330,6 +330,23 @@ AI_PROVIDER=deepseek          # 或 mimo / openai
 DEEPSEEK_API_KEY=sk-...
 ```
 
+**用 MiniMax 开放平台 Key（`sk-cp-` / `sk-api-` 开头）时，端点要换**——它们不能打 agent 端点，会直接返回 `401 auth failed`：
+
+```bash
+AI_PROVIDER=anthropic
+AI_PROTOCOL=anthropic
+AI_BASE_URL=https://api.minimaxi.com/anthropic/v1   # Anthropic 兼容端点
+AI_AUTH_MODE=bearer                                  # 开放平台走 Authorization: Bearer
+AI_API_KEY=sk-cp-...
+AI_MODEL=MiniMax-M3.1-Flash
+```
+
+OpenAI 兼容端点 `https://api.minimaxi.com/v1` 同样能通（把 `AI_PROTOCOL` 设成 `openai`）。换完 Key 先用诊断接口确认，别直接上线：
+
+```bash
+curl 'https://你的域名/api/health?probe=1'   # probe.ok=true 才算配对
+```
+
 > **`AI_MAX_TOKENS` 要给够。**带 thinking 的模型（MiniMax M3 等）会先花掉一大截输出预算做思考，给小了会在正文开始前就被截断——表现是「正文一个字都没有」。默认 16384；用 DeepSeek 时它最高输出 8K，请设 `AI_MAX_TOKENS=8192`。路由里带了兜底：被截断且零输出时会自动把预算翻 4 倍重试一次。
 
 想接自己的模型，直接改 `lib/ai/provider.ts` 即可；`scripts/smoke-ai.ts` 是打真实模型的冒烟脚本（`npm run dev` 之后跑 `npx tsx scripts/smoke-ai.ts`）。
